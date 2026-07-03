@@ -6,19 +6,23 @@ exactly the same as the original.
 
 - Works on **any laptop GPU**: NVIDIA, AMD, or Intel (including integrated
   graphics) — it uses Vulkan, so there's no CUDA/PyTorch to install.
-- **Zero setup**: one Python file, no pip packages. On first run it
-  auto-downloads the AI engine (Real-ESRGAN) and, if needed, ffmpeg.
+- **No pip packages**: one Python file. On first run it auto-downloads the
+  AI engine (Real-ESRGAN) and — on Windows and Linux — ffmpeg too
+  (macOS: `brew install ffmpeg` once).
 - **Built for speed**: anime-specific fast model (`realesr-animevideov3`),
   smart scale factor (1080p only needs 2×, not 4×), hardware video encoding
   (NVENC / QuickSync / AMF auto-detected), and the decode → GPU-upscale →
   encode stages run **in parallel**.
+- **Frame-exact**: the source is decoded exactly once into a raw frame
+  stream — there is no seeking, so no dropped or duplicated frames, even
+  for trimmed/remuxed/VFR sources.
 
 ## Quick start
 
 **Windows (easiest):** drag your clip onto **`Upscale to 4K.bat`**.
 Or double-click it and paste the clip's path when asked.
 
-**Any OS:**
+**Any OS** (on macOS/Linux type `python3` instead of `python`):
 
 ```bash
 python upscale.py                    # prompts you to paste the clip path
@@ -35,19 +39,23 @@ The result appears next to your clip as `my clip_4K.mp4`.
 ## How it works
 
 ```
-clip.mp4 ─┬─ video ─▶ decode frames ─▶ Real-ESRGAN (GPU, Vulkan) ─▶ fit to 3840×2160 ─▶ encode ─┐
-          │              (chunked, runs in parallel with the GPU and the encoder)               ├─▶ clip_4K.mp4
-          └─ audio ────────────────────────── copied unchanged (bit-for-bit) ──────────────────┘
+clip.mp4 ─┬─ video ─▶ decode ONCE ─▶ Real-ESRGAN (GPU, Vulkan) ─▶ fit to 3840×2160 ─▶ encode ─┐
+          │             (raw frame stream, chunked; all three stages run in parallel)         ├─▶ clip_4K.mp4
+          └─ audio ───────────────────── copied unchanged (bit-for-bit) ─────────────────────┘
 ```
 
-Frames are processed in small chunks so temp disk usage stays bounded, and
-the three stages overlap: while the GPU upscales chunk *N*, the CPU is
-already decoding chunk *N+1* and encoding chunk *N−1*.
+The video is decoded in a single pass into a raw frame stream that is
+sliced into chunks by frame count (seam-proof by construction). While the
+GPU upscales chunk *N*, the decoder is already producing chunk *N+1* and
+the encoder is compressing chunk *N−1*. Temp disk stays bounded because
+the decoder is blocked whenever it gets too far ahead.
 
 The scale factor is picked automatically — the smallest one that reaches 4K
 (1080p → 2×, 720p → 3×, ≤540p → 4×), because upscaling less is *much*
 faster and any small remainder is finished with a high-quality Lanczos
-resize.
+resize. Anamorphic (non-square-pixel) and rotated sources are detected and
+handled correctly, and every upscale is verified frame-by-frame — if the
+GPU runs out of memory the tool retries automatically with smaller tiles.
 
 ## Making it faster
 
@@ -62,27 +70,34 @@ resize.
 ## All options
 
 ```
-python upscale.py INPUT [-o OUTPUT]
+python upscale.py INPUT
+  -o, --output FILE   output file (default: <name>_4K.mp4 next to the input)
   --fast              speed mode (jpeg intermediates + faster encode preset)
   --scale {auto,2,3,4}  AI scale factor (default: auto)
   --model {animevideo,anime-sharp,photo}
                       animevideo = fast anime video model (default)
                       anime-sharp = crisper lines, ~4x slower
   --encoder NAME      force an ffmpeg encoder (default: auto-detect hardware)
-  --quality N         CRF/CQ quality, lower = better (default 16–19)
+  --quality N         CRF/CQ quality, lower = better (default 16-19)
   --chunk N           frames per chunk (default 150; bounds temp disk usage)
   --tile N            GPU tile size (try 256 or 128 if you run out of VRAM)
   --gpu N             GPU index (dual-GPU laptops: try 1)
+  --jobs L:P:S        upscaler threads as load:proc:save (default 2:2:2)
   --workdir DIR       where temp frames go (default: system temp)
+  --force             process even if the input is already 4K
+  --keep-temp         keep temporary frames (debugging)
   --setup-only        just download the tools and exit
+  --verbose           print every command that runs
 ```
 
 ## Troubleshooting
 
-- **"vkCreateInstance failed" / upscaler crashes instantly** — update your
-  GPU driver (Vulkan comes with it). NVIDIA: GeForce Experience / nvidia.com;
-  AMD: Adrenalin; Intel: intel.com/download-center.
-- **Out of VRAM / upscaler dies mid-chunk** — the tool auto-retries with
+- **It's running but VERY slowly, or it warned about Vulkan/GPU** — the AI
+  engine silently falls back to your CPU when no usable Vulkan driver is
+  found (the tool warns when it detects this). Update your GPU driver:
+  NVIDIA (nvidia.com), AMD (Adrenalin), or Intel (intel.com/download-center),
+  then run again.
+- **Out of VRAM / "upscale incomplete"** — the tool auto-retries with
   smaller tiles, but you can pin it: `--tile 128`.
 - **It's using the wrong GPU** (dual-GPU laptop) — try `--gpu 1`.
 - **Output is `.mkv` instead of `.mp4`** — your clip's audio codec (e.g.
@@ -90,10 +105,12 @@ python upscale.py INPUT [-o OUTPUT]
   bit-identical. Every player (VLC, MPC-HC, mpv) handles MKV fine.
 - **Input is already 4K** — the tool refuses by default; use `--force`.
 - **macOS: "cannot be opened because the developer cannot be verified"** —
-  run `xattr -dr com.apple.quarantine bin/realesrgan` once.
+  run `xattr -dr com.apple.quarantine bin/realesrgan` once (from this
+  project's folder).
 
 ## Credits
 
 - AI models & engine: [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN)
-  (`realesr-animevideov3`) running on [ncnn](https://github.com/Tencent/ncnn) Vulkan.
+  (`realesr-animevideov3`) running on [ncnn](https://github.com/Tencent/ncnn)
+  Vulkan (BSD-3-Clause).
 - Video plumbing: [FFmpeg](https://ffmpeg.org/).
