@@ -1,0 +1,890 @@
+#!/usr/bin/env python3
+"""
+ANIME 4K UPSCALER
+=================
+Paste an anime clip -> get an Ultra 4K UHD version. Audio is copied
+bit-for-bit (sound stays identical). Runs on your laptop GPU (NVIDIA,
+AMD or Intel) through Vulkan -- no CUDA / PyTorch install needed.
+
+Quick start:
+    python upscale.py                 (then paste the path of your clip)
+    python upscale.py "my clip.mp4"   (direct)
+    python upscale.py clip.mp4 --fast (speed over max quality)
+
+First run auto-downloads the AI engine (Real-ESRGAN ncnn Vulkan) and,
+on Windows, ffmpeg. Everything lands in ./bin next to this script.
+
+No pip packages required -- Python 3.8+ standard library only.
+"""
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.request
+import zipfile
+from fractions import Fraction
+
+# --------------------------------------------------------------------------
+# Constants
+# --------------------------------------------------------------------------
+
+TARGET_LONG = 3840   # 4K UHD box (long side)
+TARGET_SHORT = 2160  # 4K UHD box (short side)
+
+REALESRGAN_RELEASE = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
+    "realesrgan-ncnn-vulkan-20220424-{os}.zip"
+)
+REALESRGAN_OS = {"Windows": "windows", "Linux": "ubuntu", "Darwin": "macos"}
+REALESRGAN_EXE = {
+    "Windows": "realesrgan-ncnn-vulkan.exe",
+    "Linux": "realesrgan-ncnn-vulkan",
+    "Darwin": "realesrgan-ncnn-vulkan",
+}
+
+FFMPEG_WIN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+FFMPEG_LINUX_URL = (
+    "https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz"
+)
+
+MODELS = {
+    # key: (model name passed to realesrgan, allowed scales, blurb)
+    "animevideo": ("realesr-animevideov3", (2, 3, 4), "fast anime-video model (default)"),
+    "anime-sharp": ("realesrgan-x4plus-anime", (4,), "sharper lines, ~4x slower"),
+    "photo": ("realesrgan-x4plus", (4,), "general/photo model, slow"),
+}
+
+# Audio codecs that can be stream-copied into an .mp4 container.
+MP4_AUDIO_OK = {"aac", "mp3", "ac3", "eac3", "alac"}
+
+# Hardware encoders to probe, best-first. libx264 is the universal fallback.
+HW_ENCODERS = ["hevc_nvenc", "h264_nvenc", "hevc_qsv", "h264_qsv",
+               "hevc_amf", "h264_amf"]
+
+MAX_PENDING_ENCODES = 2  # encoder processes allowed to run behind the GPU
+
+VERBOSE = False
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+
+def info(msg):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"[!] {msg}", flush=True)
+
+
+def die(msg, code=1):
+    print(f"\n[X] {msg}", file=sys.stderr, flush=True)
+    sys.exit(code)
+
+
+def fmt_time(seconds):
+    seconds = max(0, int(seconds))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m:02d}:{s:02d}"
+
+
+def script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+class ProcRegistry:
+    """Tracks live child processes so Ctrl+C can kill them all."""
+
+    def __init__(self):
+        self._procs = set()
+        self._lock = threading.Lock()
+
+    def add(self, proc):
+        with self._lock:
+            self._procs.add(proc)
+
+    def discard(self, proc):
+        with self._lock:
+            self._procs.discard(proc)
+
+    def kill_all(self):
+        with self._lock:
+            procs = list(self._procs)
+        for p in procs:
+            try:
+                p.kill()
+            except OSError:
+                pass
+
+
+PROCS = ProcRegistry()
+
+
+def run(cmd, desc="command", capture=False):
+    """Run a subprocess to completion; raise RuntimeError with stderr tail on failure."""
+    if VERBOSE:
+        info("  $ " + " ".join(str(c) for c in cmd))
+    proc = subprocess.Popen(
+        [str(c) for c in cmd],
+        stdout=subprocess.PIPE if capture else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    PROCS.add(proc)
+    try:
+        out, err = proc.communicate()
+    finally:
+        PROCS.discard(proc)
+    if proc.returncode != 0:
+        tail = (err or b"").decode("utf-8", "replace").strip().splitlines()[-8:]
+        raise RuntimeError(f"{desc} failed (exit {proc.returncode}):\n  " + "\n  ".join(tail))
+    return (out or b"").decode("utf-8", "replace")
+
+
+def start(cmd, desc="command"):
+    """Start a subprocess without waiting. Returns (Popen, desc)."""
+    if VERBOSE:
+        info("  $ " + " ".join(str(c) for c in cmd))
+    proc = subprocess.Popen(
+        [str(c) for c in cmd],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    PROCS.add(proc)
+    return proc, desc
+
+
+def finish(started):
+    """Wait for a process from start(); raise on failure."""
+    proc, desc = started
+    _, err = proc.communicate()
+    PROCS.discard(proc)
+    if proc.returncode != 0:
+        tail = (err or b"").decode("utf-8", "replace").strip().splitlines()[-8:]
+        raise RuntimeError(f"{desc} failed (exit {proc.returncode}):\n  " + "\n  ".join(tail))
+
+
+# --------------------------------------------------------------------------
+# Tool bootstrap (ffmpeg + Real-ESRGAN auto-download)
+# --------------------------------------------------------------------------
+
+
+def download(url, dest, label):
+    info(f"[*] Downloading {label} ...")
+    info(f"    {url}")
+    tmp = dest + ".part"
+
+    def hook(blocks, block_size, total):
+        got = blocks * block_size
+        if total > 0:
+            pct = min(100.0, got * 100.0 / total)
+            sys.stdout.write(f"\r    {pct:5.1f}%  ({got // (1 << 20)} MB / {total // (1 << 20)} MB)")
+        else:
+            sys.stdout.write(f"\r    {got // (1 << 20)} MB")
+        sys.stdout.flush()
+
+    try:
+        urllib.request.urlretrieve(url, tmp, reporthook=hook)
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise RuntimeError(f"download of {label} failed: {e}") from e
+    sys.stdout.write("\n")
+    os.replace(tmp, dest)
+
+
+def extract_archive(archive, dest):
+    if archive.endswith(".zip"):
+        with zipfile.ZipFile(archive) as z:
+            z.extractall(dest)
+    elif archive.endswith((".tar.xz", ".tar.gz", ".txz", ".tgz")):
+        with tarfile.open(archive) as t:
+            t.extractall(dest)
+    else:
+        raise RuntimeError(f"unknown archive type: {archive}")
+
+
+def find_in_tree(root, filename):
+    for base, _dirs, files in os.walk(root):
+        if filename in files:
+            return os.path.join(base, filename)
+    return None
+
+
+def ensure_ffmpeg(bin_dir):
+    """Return (ffmpeg, ffprobe) paths; download static builds if missing."""
+    exe = ".exe" if os.name == "nt" else ""
+    # 1) already on PATH
+    ff, fp = shutil.which("ffmpeg"), shutil.which("ffprobe")
+    if ff and fp:
+        return ff, fp
+    # 2) previously downloaded
+    ff = find_in_tree(bin_dir, "ffmpeg" + exe)
+    fp = find_in_tree(bin_dir, "ffprobe" + exe)
+    if ff and fp:
+        return ff, fp
+    # 3) download
+    os.makedirs(bin_dir, exist_ok=True)
+    system = platform.system()
+    if system == "Windows":
+        archive = os.path.join(bin_dir, "ffmpeg.zip")
+        download(FFMPEG_WIN_URL, archive, "ffmpeg (one-time, ~90 MB)")
+    elif system == "Linux":
+        archive = os.path.join(bin_dir, "ffmpeg.tar.xz")
+        download(FFMPEG_LINUX_URL, archive, "ffmpeg static build (one-time, ~40 MB)")
+    else:
+        die("ffmpeg not found. Install it first, e.g.:  brew install ffmpeg")
+    extract_archive(archive, bin_dir)
+    os.remove(archive)
+    ff = find_in_tree(bin_dir, "ffmpeg" + exe)
+    fp = find_in_tree(bin_dir, "ffprobe" + exe)
+    if not (ff and fp):
+        die("ffmpeg download did not contain expected binaries")
+    if os.name != "nt":
+        os.chmod(ff, 0o755)
+        os.chmod(fp, 0o755)
+    return ff, fp
+
+
+def ensure_realesrgan(bin_dir):
+    """Return (exe, models_dir); download the release zip if missing."""
+    system = platform.system()
+    exe_name = REALESRGAN_EXE.get(system)
+    if exe_name is None:
+        die(f"unsupported OS for the GPU upscaler: {system}")
+
+    # allow a user-provided binary on PATH (models dir must sit next to it)
+    on_path = shutil.which("realesrgan-ncnn-vulkan")
+    if on_path:
+        models = os.path.join(os.path.dirname(os.path.abspath(on_path)), "models")
+        if os.path.isdir(models):
+            return on_path, models
+
+    exe = find_in_tree(bin_dir, exe_name)
+    if exe:
+        models = os.path.join(os.path.dirname(exe), "models")
+        if os.path.isdir(models):
+            return exe, models
+
+    os_tag = REALESRGAN_OS[system]
+    url = REALESRGAN_RELEASE.format(os=os_tag)
+    target = os.path.join(bin_dir, "realesrgan")
+    os.makedirs(target, exist_ok=True)
+    archive = os.path.join(bin_dir, "realesrgan.zip")
+    download(url, archive, "Real-ESRGAN AI upscaler (one-time, ~40 MB)")
+    extract_archive(archive, target)
+    os.remove(archive)
+    exe = find_in_tree(target, exe_name)
+    if not exe:
+        die("Real-ESRGAN download did not contain the expected binary")
+    if os.name != "nt":
+        os.chmod(exe, 0o755)
+    models = os.path.join(os.path.dirname(exe), "models")
+    if not os.path.isdir(models):
+        die("Real-ESRGAN download did not contain the models folder")
+    return exe, models
+
+
+# --------------------------------------------------------------------------
+# Probing
+# --------------------------------------------------------------------------
+
+
+class VideoInfo:
+    def __init__(self, width, height, fps, duration, est_frames,
+                 audio_codec, video_codec):
+        self.width = width
+        self.height = height
+        self.fps = fps                  # Fraction
+        self.duration = duration       # float seconds (may be 0 if unknown)
+        self.est_frames = est_frames   # int estimate, for progress only
+        self.audio_codec = audio_codec  # None if no audio
+        self.video_codec = video_codec
+
+
+def probe(ffprobe, path):
+    out = run(
+        [ffprobe, "-v", "error", "-print_format", "json",
+         "-show_streams", "-show_format", path],
+        desc="ffprobe", capture=True,
+    )
+    data = json.loads(out)
+    vstream = None
+    astream = None
+    for s in data.get("streams", []):
+        if s.get("codec_type") == "video" and vstream is None:
+            # skip attached cover art
+            if s.get("disposition", {}).get("attached_pic"):
+                continue
+            vstream = s
+        elif s.get("codec_type") == "audio" and astream is None:
+            astream = s
+    if vstream is None:
+        die("no video stream found in the input file")
+
+    def parse_rate(txt):
+        try:
+            frac = Fraction(txt)
+            return frac if frac > 0 else None
+        except (ValueError, ZeroDivisionError):
+            return None
+
+    fps = parse_rate(vstream.get("avg_frame_rate", "0/0")) or \
+        parse_rate(vstream.get("r_frame_rate", "0/0"))
+    if fps is None:
+        warn("could not detect frame rate; assuming 24000/1001 (23.976)")
+        fps = Fraction(24000, 1001)
+    # guard against bogus rates from broken headers
+    if fps > 240:
+        alt = parse_rate(vstream.get("r_frame_rate", "0/0"))
+        fps = alt if alt and alt <= 240 else Fraction(24000, 1001)
+
+    duration = 0.0
+    for src in (vstream.get("duration"), data.get("format", {}).get("duration")):
+        try:
+            duration = float(src)
+            break
+        except (TypeError, ValueError):
+            continue
+
+    est_frames = 0
+    try:
+        est_frames = int(vstream.get("nb_frames", 0))
+    except (TypeError, ValueError):
+        pass
+    if est_frames <= 0 and duration > 0:
+        est_frames = int(duration * fps) + 1
+
+    return VideoInfo(
+        width=int(vstream["width"]),
+        height=int(vstream["height"]),
+        fps=fps,
+        duration=duration,
+        est_frames=max(est_frames, 1),
+        audio_codec=astream.get("codec_name") if astream else None,
+        video_codec=vstream.get("codec_name", "?"),
+    )
+
+
+def ffmpeg_supports_fps_mode(ffmpeg):
+    """-fps_mode replaced -vsync in ffmpeg 5.1."""
+    try:
+        out = run([ffmpeg, "-version"], desc="ffmpeg -version", capture=True)
+        m = re.search(r"ffmpeg version n?(\d+)\.(\d+)", out)
+        if m:
+            return (int(m.group(1)), int(m.group(2))) >= (5, 1)
+        m = re.search(r"ffmpeg version n?(\d+)", out)
+        if m:
+            return int(m.group(1)) >= 6
+    except RuntimeError:
+        pass
+    return True  # assume modern
+
+
+# --------------------------------------------------------------------------
+# Planning
+# --------------------------------------------------------------------------
+
+
+def choose_ai_scale(width, height, allowed):
+    """Smallest allowed AI factor that reaches the 4K box (fit-inside)."""
+    long_side, short_side = max(width, height), min(width, height)
+    fit = min(TARGET_LONG / long_side, TARGET_SHORT / short_side)
+    for s in sorted(allowed):
+        if s >= fit:
+            return s, fit
+    return max(allowed), fit
+
+
+def target_box(width, height):
+    """4K UHD box, oriented to match the source."""
+    if height > width:
+        return TARGET_SHORT, TARGET_LONG
+    return TARGET_LONG, TARGET_SHORT
+
+
+def final_dims(width, height):
+    """Final output size: fit inside the 4K box, keep aspect, force even."""
+    tw, th = target_box(width, height)
+    ratio = min(tw / width, th / height)
+    w = int(width * ratio) // 2 * 2
+    h = int(height * ratio) // 2 * 2
+    return max(w, 2), max(h, 2)
+
+
+def scale_filter(width, height):
+    tw, th = target_box(width, height)
+    return (
+        f"scale=w={tw}:h={th}:force_original_aspect_ratio=decrease:"
+        f"force_divisible_by=2:flags=lanczos:out_color_matrix=bt709"
+    )
+
+
+def detect_encoder(ffmpeg, forced=None):
+    """Pick the fastest working encoder by actually test-encoding one frame."""
+    candidates = [forced] if forced else HW_ENCODERS + ["libx264"]
+    for enc in candidates:
+        cmd = [ffmpeg, "-v", "error", "-f", "lavfi",
+               "-i", "color=black:s=256x256:d=0.2:r=24",
+               "-frames:v", "3", "-c:v", enc]
+        cmd += encoder_quality_args(enc, quality=None, fast=True)
+        cmd += ["-f", "null", "-"]
+        try:
+            run(cmd, desc=f"encoder test ({enc})")
+            return enc
+        except RuntimeError:
+            if forced:
+                die(f"requested encoder '{forced}' is not usable on this machine")
+            continue
+    die("no working video encoder found in ffmpeg")
+
+
+def encoder_quality_args(enc, quality, fast):
+    """Quality/preset flags per encoder family. quality=None -> default."""
+    args = []
+    if enc.endswith("_nvenc"):
+        q = quality if quality is not None else 19
+        args += ["-preset", "p4" if fast else "p5", "-tune", "hq",
+                 "-rc", "vbr", "-cq", str(q), "-b:v", "0"]
+    elif enc.endswith("_qsv"):
+        q = quality if quality is not None else 19
+        args += ["-global_quality", str(q), "-preset",
+                 "fast" if fast else "slow"]
+    elif enc.endswith("_amf"):
+        q = quality if quality is not None else 19
+        args += ["-quality", "speed" if fast else "quality",
+                 "-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
+    else:  # libx264
+        q = quality if quality is not None else (18 if fast else 16)
+        args += ["-crf", str(q), "-preset", "veryfast" if fast else "medium"]
+    if enc.startswith("hevc"):
+        args += ["-tag:v", "hvc1"]
+    return args
+
+
+# --------------------------------------------------------------------------
+# Progress display
+# --------------------------------------------------------------------------
+
+
+class Progress:
+    """Single-line progress bar: frames upscaled / total, rate, ETA."""
+
+    def __init__(self, total_frames):
+        self.total = max(total_frames, 1)
+        self.done_base = 0          # frames from completed chunks
+        self.current_dir = None     # out-dir of the chunk being upscaled
+        self.lock = threading.Lock()
+        self.start_time = time.time()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+
+    def start(self):
+        self._thread.start()
+
+    def set_current(self, out_dir):
+        with self.lock:
+            self.current_dir = out_dir
+
+    def chunk_done(self, frames):
+        with self.lock:
+            self.done_base += frames
+            self.current_dir = None
+
+    def _count(self):
+        with self.lock:
+            base, cur = self.done_base, self.current_dir
+        extra = 0
+        if cur and os.path.isdir(cur):
+            try:
+                extra = len(os.listdir(cur))
+            except OSError:
+                extra = 0
+        return base + extra
+
+    def _loop(self):
+        while not self._stop.wait(0.5):
+            self._render()
+
+    def _render(self, final=False):
+        done = min(self._count(), self.total)
+        elapsed = time.time() - self.start_time
+        rate = done / elapsed if elapsed > 0 else 0.0
+        remaining = (self.total - done) / rate if rate > 0 else 0
+        pct = done * 100.0 / self.total
+        if not final:
+            pct = min(pct, 99.9)
+        width = 26
+        filled = int(width * pct / 100)
+        bar = "#" * filled + "-" * (width - filled)
+        eta = fmt_time(remaining) if (rate > 0 and not final) else "--:--"
+        if final:
+            eta = fmt_time(0)
+        line = (f"\r  [{bar}] {pct:5.1f}%  {done}/{self.total} frames"
+                f"  {rate:5.1f} f/s  ETA {eta}   ")
+        sys.stdout.write(line)
+        sys.stdout.flush()
+
+    def finish(self):
+        self._stop.set()
+        self._thread.join(timeout=2)
+        with self.lock:
+            self.done_base = self.total
+            self.current_dir = None
+        self._render(final=True)
+        sys.stdout.write("\n")
+
+
+# --------------------------------------------------------------------------
+# The pipeline
+# --------------------------------------------------------------------------
+
+
+class Pipeline:
+    def __init__(self, args, tools, vinfo):
+        self.args = args
+        self.ffmpeg = tools["ffmpeg"]
+        self.realesrgan = tools["realesrgan"]
+        self.models_dir = tools["models"]
+        self.v = vinfo
+        self.model_name, allowed, _ = MODELS[args.model]
+        if args.scale != "auto":
+            s = int(args.scale)
+            if s not in allowed:
+                die(f"model '{args.model}' only supports scales {allowed}")
+            self.ai_scale = s
+        else:
+            self.ai_scale, _fit = choose_ai_scale(vinfo.width, vinfo.height, allowed)
+        self.img_ext = "jpg" if args.fast else "png"
+        self.fps_str = f"{vinfo.fps.numerator}/{vinfo.fps.denominator}"
+        self.use_fps_mode = ffmpeg_supports_fps_mode(self.ffmpeg)
+        self.encoder = detect_encoder(self.ffmpeg, args.encoder)
+        self.out_w, self.out_h = final_dims(vinfo.width, vinfo.height)
+
+    # ---- commands ------------------------------------------------------
+
+    def extract_cmd(self, start_s, nframes, out_dir):
+        cfr = ["-fps_mode", "cfr"] if self.use_fps_mode else ["-vsync", "cfr"]
+        cmd = [self.ffmpeg, "-v", "error", "-y",
+               "-ss", f"{start_s:.6f}", "-i", self.args.input,
+               "-map", "0:v:0", "-r", self.fps_str] + cfr + \
+              ["-frames:v", str(nframes)]
+        if self.img_ext == "jpg":
+            cmd += ["-q:v", "2", "-pix_fmt", "yuvj444p"]
+        else:
+            cmd += ["-compression_level", "1"]
+        cmd += [os.path.join(out_dir, f"%08d.{self.img_ext}")]
+        return cmd
+
+    def upscale_cmd(self, in_dir, out_dir, tile):
+        cmd = [self.realesrgan, "-i", in_dir, "-o", out_dir,
+               "-n", self.model_name, "-s", str(self.ai_scale),
+               "-m", self.models_dir, "-f", self.img_ext,
+               "-j", self.args.jobs]
+        if tile:
+            cmd += ["-t", str(tile)]
+        if self.args.gpu is not None:
+            cmd += ["-g", str(self.args.gpu)]
+        return cmd
+
+    def encode_cmd(self, in_dir, out_file):
+        cmd = [self.ffmpeg, "-v", "error", "-y",
+               "-framerate", self.fps_str,
+               "-i", os.path.join(in_dir, f"%08d.{self.img_ext}"),
+               "-vf", scale_filter(self.v.width * self.ai_scale,
+                                   self.v.height * self.ai_scale),
+               "-c:v", self.encoder]
+        cmd += encoder_quality_args(self.encoder, self.args.quality, self.args.fast)
+        cmd += ["-pix_fmt", "yuv420p",
+                "-colorspace", "bt709", "-color_primaries", "bt709",
+                "-color_trc", "bt709",
+                out_file]
+        return cmd
+
+    # ---- steps ---------------------------------------------------------
+
+    def extract(self, chunk_idx, workdir):
+        """Blocking extraction of one chunk. Returns (in_dir, n_frames)."""
+        started = self.start_extract(chunk_idx, workdir)
+        return self.finish_extract(started)
+
+    def start_extract(self, chunk_idx, workdir):
+        in_dir = os.path.join(workdir, f"in_{chunk_idx:05d}")
+        os.makedirs(in_dir, exist_ok=True)
+        start_s = float(chunk_idx * self.args.chunk / self.v.fps)
+        proc = start(self.extract_cmd(start_s, self.args.chunk, in_dir),
+                     desc=f"frame extraction (chunk {chunk_idx})")
+        return proc, in_dir
+
+    def finish_extract(self, started):
+        proc, in_dir = started
+        finish(proc)
+        n = len([f for f in os.listdir(in_dir) if f.endswith("." + self.img_ext)])
+        return in_dir, n
+
+    def upscale(self, in_dir, out_dir):
+        """Blocking GPU upscale with auto-retry on smaller tiles (VRAM)."""
+        os.makedirs(out_dir, exist_ok=True)
+        tiles = [self.args.tile] if self.args.tile else [0, 256, 128]
+        last_err = None
+        for i, tile in enumerate(tiles):
+            try:
+                run(self.upscale_cmd(in_dir, out_dir, tile), desc="AI upscale")
+                return
+            except RuntimeError as e:
+                last_err = e
+                if i + 1 < len(tiles):
+                    warn(f"upscaler failed (possibly out of VRAM); retrying "
+                         f"with tile size {tiles[i + 1]} ...")
+        raise last_err
+
+    # ---- main loop ------------------------------------------------------
+
+    def process(self, workdir):
+        """Chunked pipeline with extract-ahead and background encodes.
+        Returns list of encoded chunk files (in order)."""
+        chunk_files = []
+        pending = []          # [(started_proc, frame_dirs_to_delete)]
+        progress = Progress(self.v.est_frames)
+        progress.start()
+
+        def reap(block_all=False):
+            while pending and (block_all or len(pending) >= MAX_PENDING_ENCODES
+                               or pending[0][0][0].poll() is not None):
+                started, dirs = pending.pop(0)
+                finish(started)
+                if not self.args.keep_temp:
+                    for d in dirs:
+                        shutil.rmtree(d, ignore_errors=True)
+
+        try:
+            idx = 0
+            cur = self.finish_extract(self.start_extract(0, workdir))
+            while True:
+                in_dir, n = cur
+                if n == 0:
+                    if not self.args.keep_temp:
+                        shutil.rmtree(in_dir, ignore_errors=True)
+                    break
+                # prefetch next chunk while the GPU chews on this one
+                nxt = None
+                if n == self.args.chunk:
+                    nxt = self.start_extract(idx + 1, workdir)
+
+                out_dir = os.path.join(workdir, f"out_{idx:05d}")
+                progress.set_current(out_dir)
+                self.upscale(in_dir, out_dir)
+                progress.chunk_done(n)
+
+                chunk_file = os.path.join(workdir, f"chunk_{idx:05d}.mp4")
+                enc = start(self.encode_cmd(out_dir, chunk_file),
+                            desc=f"encode (chunk {idx})")
+                pending.append((enc, [in_dir, out_dir]))
+                chunk_files.append(chunk_file)
+                reap()
+
+                if nxt is None:
+                    break
+                cur = self.finish_extract(nxt)
+                idx += 1
+            reap(block_all=True)
+            progress.finish()
+        except BaseException:
+            progress._stop.set()
+            sys.stdout.write("\n")
+            raise
+        return chunk_files
+
+    def mux(self, chunk_files, workdir, out_file):
+        """Concat chunks and stream-copy the original audio (bit-identical)."""
+        list_file = os.path.join(workdir, "concat.txt")
+        with open(list_file, "w", encoding="utf-8") as f:
+            for c in chunk_files:
+                escaped = c.replace("'", "'\\''")
+                f.write(f"file '{escaped}'\n")
+        cmd = [self.ffmpeg, "-v", "error", "-y",
+               "-f", "concat", "-safe", "0", "-i", list_file,
+               "-i", self.args.input,
+               "-map", "0:v:0", "-map", "1:a?",
+               "-c:v", "copy", "-c:a", "copy",
+               "-map_metadata", "1"]
+        if out_file.lower().endswith(".mp4"):
+            cmd += ["-movflags", "+faststart"]
+        cmd += [out_file]
+        run(cmd, desc="final mux")
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+
+def default_output(input_path, audio_codec):
+    base, _ext = os.path.splitext(input_path)
+    ext = ".mp4"
+    if audio_codec and audio_codec not in MP4_AUDIO_OK:
+        ext = ".mkv"  # container that can hold any audio codec unchanged
+    return base + "_4K" + ext
+
+
+def check_output_container(out_file, audio_codec):
+    if (audio_codec and audio_codec not in MP4_AUDIO_OK
+            and out_file.lower().endswith((".mp4", ".mov", ".m4v"))):
+        fixed = os.path.splitext(out_file)[0] + ".mkv"
+        warn(f"audio codec '{audio_codec}' cannot be copied into .mp4; "
+             f"writing {os.path.basename(fixed)} instead (audio unchanged)")
+        return fixed
+    return out_file
+
+
+def interactive_input():
+    info("=" * 60)
+    info("  ANIME 4K UPSCALER  --  paste your clip's path below")
+    info("=" * 60)
+    while True:
+        try:
+            raw = input("\nClip path: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            sys.exit(0)
+        # Windows "Copy as path" wraps in quotes; drag&drop may too
+        path = raw.strip('"').strip("'")
+        if path and os.path.isfile(path):
+            return path
+        info("  That file does not exist -- try again (tip: right-click the")
+        info("  file -> 'Copy as path', then paste it here).")
+
+
+def parse_args(argv):
+    p = argparse.ArgumentParser(
+        prog="upscale.py",
+        description="Upscale an anime clip to Ultra 4K UHD on your laptop GPU. "
+                    "Audio is copied unchanged.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("input", nargs="?", help="video file (omit to be prompted)")
+    p.add_argument("-o", "--output", help="output file (default: <name>_4K.mp4)")
+    p.add_argument("--fast", action="store_true",
+                   help="speed mode: jpeg intermediates + faster encoder preset")
+    p.add_argument("--scale", choices=["auto", "2", "3", "4"], default="auto",
+                   help="AI scale factor (auto = smallest that reaches 4K)")
+    p.add_argument("--model", choices=sorted(MODELS), default="animevideo",
+                   help="AI model: " + "; ".join(f"{k}={v[2]}" for k, v in MODELS.items()))
+    p.add_argument("--encoder", help="force a specific ffmpeg video encoder "
+                                     "(default: auto-detect NVENC/QSV/AMF, else x264)")
+    p.add_argument("--quality", type=int,
+                   help="encoder quality (CRF/CQ, lower=better; default 16-19)")
+    p.add_argument("--chunk", type=int, default=150,
+                   help="frames per chunk (bounds temp disk usage)")
+    p.add_argument("--tile", type=int,
+                   help="GPU tile size (default auto; use 256/128 on low VRAM)")
+    p.add_argument("--gpu", type=int, help="GPU index (dual-GPU laptops: try 1)")
+    p.add_argument("--jobs", default="2:2:2",
+                   help="upscaler threads as load:proc:save")
+    p.add_argument("--workdir", help="directory for temp files "
+                                     "(default: system temp)")
+    p.add_argument("--keep-temp", action="store_true",
+                   help="keep temporary frames (debugging)")
+    p.add_argument("--force", action="store_true",
+                   help="process even if the input is already 4K")
+    p.add_argument("--setup-only", action="store_true",
+                   help="download the tools and exit")
+    p.add_argument("--verbose", action="store_true", help="print every command")
+    return p.parse_args(argv)
+
+
+def main(argv=None):
+    global VERBOSE
+    args = parse_args(argv)
+    VERBOSE = args.verbose
+
+    bin_dir = os.path.join(script_dir(), "bin")
+    try:
+        ffmpeg, ffprobe = ensure_ffmpeg(bin_dir)
+        realesrgan, models = ensure_realesrgan(bin_dir)
+    except RuntimeError as e:
+        die(str(e))
+    if args.setup_only:
+        info("[+] Tools ready:")
+        info(f"    ffmpeg     : {ffmpeg}")
+        info(f"    upscaler   : {realesrgan}")
+        return 0
+
+    if not args.input:
+        args.input = interactive_input()
+    args.input = os.path.abspath(args.input.strip('"').strip("'"))
+    if not os.path.isfile(args.input):
+        die(f"input file not found: {args.input}")
+
+    v = probe(ffprobe, args.input)
+
+    ow, oh = final_dims(v.width, v.height)
+    if min(TARGET_LONG / max(v.width, v.height),
+           TARGET_SHORT / min(v.width, v.height)) <= 1.0 and not args.force:
+        die(f"input is already {v.width}x{v.height} (>= 4K). "
+            f"Use --force to process anyway.")
+
+    tools = {"ffmpeg": ffmpeg, "ffprobe": ffprobe,
+             "realesrgan": realesrgan, "models": models}
+    pipe = Pipeline(args, tools, v)
+
+    out_file = args.output or default_output(args.input, v.audio_codec)
+    out_file = check_output_container(os.path.abspath(out_file), v.audio_codec)
+
+    fps_f = float(v.fps)
+    info("")
+    info(f"  Input   : {os.path.basename(args.input)}")
+    info(f"            {v.width}x{v.height} {v.video_codec} @ {fps_f:.3f} fps"
+         f"  |  {fmt_time(v.duration)}  |  ~{v.est_frames} frames")
+    info(f"  Audio   : {v.audio_codec or 'none'} (copied unchanged)")
+    info(f"  Output  : {os.path.basename(out_file)}  ->  {ow}x{oh} (Ultra 4K UHD)")
+    info(f"  AI      : {pipe.model_name} x{pipe.ai_scale} on GPU (Vulkan)")
+    info(f"  Encoder : {pipe.encoder}"
+         + ("  [hardware]" if pipe.encoder != "libx264" else "  [cpu]")
+         + ("  |  FAST mode" if args.fast else ""))
+    info("")
+
+    workdir_root = args.workdir or tempfile.gettempdir()
+    os.makedirs(workdir_root, exist_ok=True)
+    free_gb = shutil.disk_usage(workdir_root).free / (1 << 30)
+    if free_gb < 8:
+        warn(f"only {free_gb:.1f} GB free in {workdir_root}; consider "
+             f"--workdir on a bigger drive or --fast (uses ~10x less space)")
+
+    workdir = tempfile.mkdtemp(prefix="anime4k_", dir=workdir_root)
+    t0 = time.time()
+    try:
+        chunks = pipe.process(workdir)
+        if not chunks:
+            die("no frames could be extracted from the input")
+        info("[*] Stitching chunks + copying original audio ...")
+        pipe.mux(chunks, workdir, out_file)
+    except KeyboardInterrupt:
+        PROCS.kill_all()
+        die("interrupted -- partial files cleaned up", code=130)
+    except RuntimeError as e:
+        PROCS.kill_all()
+        die(str(e))
+    finally:
+        if not args.keep_temp:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+    dt = time.time() - t0
+    size_mb = os.path.getsize(out_file) / (1 << 20)
+    info("")
+    info(f"[+] DONE in {fmt_time(dt)}  ({v.est_frames / dt:.1f} frames/s overall)")
+    info(f"[+] {out_file}  ({size_mb:.1f} MB)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

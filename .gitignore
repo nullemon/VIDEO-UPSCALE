@@ -1,0 +1,11 @@
+# auto-downloaded tools (ffmpeg + Real-ESRGAN, fetched on first run)
+/bin/
+
+# python
+__pycache__/
+*.pyc
+
+# outputs / scratch
+*_4K.mp4
+*_4K.mkv
+anime4k_*/
