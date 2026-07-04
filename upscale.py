@@ -760,6 +760,12 @@ class Pipeline:
         self.fps2_str = f"{f2.numerator}/{f2.denominator}"
         self.rife = tools.get("rife")
         self.rife_root = tools.get("rife_root")
+        self.preview = None
+        if args.preview:
+            dur = 8.0
+            ss = max(0.0, vinfo.duration / 2 - dur / 2) if vinfo.duration else 0.0
+            self.preview = (ss, dur)
+            vinfo.est_frames = min(vinfo.est_frames, int(dur * vinfo.fps) + 2)
 
     # ---- commands ------------------------------------------------------
 
@@ -767,11 +773,14 @@ class Pipeline:
         """ONE pass over the source: decode -> CFR -> rgb24 raw stream.
         No seeking anywhere, so chunk seams can never drop/dup frames."""
         cfr = ["-fps_mode", "cfr"] if self.use_fps_mode else ["-vsync", "cfr"]
-        return [self.ffmpeg, "-v", "error", "-nostdin", "-i", self.args.input,
+        seek = ["-ss", f"{self.preview[0]:.3f}"] if self.preview else []
+        limit = ["-t", f"{self.preview[1]:.3f}"] if self.preview else []
+        return [self.ffmpeg, "-v", "error", "-nostdin"] + seek + \
+               ["-i", self.args.input,
                 "-map", "0:v:0",
                 "-vf", (f"scale=in_color_matrix={self.src_matrix}:"
                         f"flags=lanczos+full_chroma_int+accurate_rnd"),
-                "-r", self.fps_str] + cfr + \
+                "-r", self.fps_str] + cfr + limit + \
                ["-pix_fmt", "rgb24", "-f", "rawvideo", "-"]
 
     def writer_cmd(self, out_dir):
@@ -1094,10 +1103,13 @@ class Pipeline:
             for c in chunk_files:
                 escaped = c.replace("'", "'\\''")
                 f.write(f"file '{escaped}'\n")
+        audio_src = ["-i", self.args.input]
+        if self.preview:
+            audio_src = ["-ss", f"{self.preview[0]:.3f}",
+                         "-t", f"{self.preview[1]:.3f}"] + audio_src
         cmd = [self.ffmpeg, "-v", "error", "-y",
-               "-f", "concat", "-safe", "0", "-i", list_file,
-               "-i", self.args.input,
-               "-map", "0:v:0", "-map", "1:a?",
+               "-f", "concat", "-safe", "0", "-i", list_file] + audio_src + \
+              ["-map", "0:v:0", "-map", "1:a?",
                "-c:v", "copy", "-c:a", "copy",
                "-map_metadata", "1"]
         if out_file.lower().endswith(".mp4"):
@@ -1196,6 +1208,9 @@ def parse_args(argv):
     p.add_argument("--custom-model", metavar="NAME",
                    help="use a community ncnn model you dropped into the "
                         "esrgan models folder (requires explicit --scale)")
+    p.add_argument("--preview", action="store_true",
+                   help="render only ~8 seconds from the middle of the clip "
+                        "-- fast way to compare settings before a full run")
     p.add_argument("--scale", choices=["auto", "2", "3", "4"], default="auto",
                    help="AI scale factor (auto = smallest that reaches 4K)")
     p.add_argument("--engine", choices=["esrgan", "cugan"],
@@ -1257,12 +1272,17 @@ def main(argv=None):
     if args.reel:
         args.eyecandy = True
         args.smooth = True
-        if args.engine is None:
-            args.engine = "cugan"
-        if args.engine == "cugan" and args.denoise == 0:
-            args.denoise = 3
         if args.quality is None:
             args.quality = 15
+        if args.engine is None:
+            # default reel path: the SHARP model. Strong cugan denoise
+            # melts detail on decent sources -- only use it when asked
+            # (--reel --engine cugan --denoise 3 for junky rips).
+            args.engine = "esrgan"
+            if args.model is None and not args.fast:
+                args.best = True
+        elif args.engine == "cugan" and args.denoise == 0:
+            args.denoise = 3
     if args.engine is None:
         args.engine = "esrgan"
     if args.model is not None and args.engine == "cugan":
@@ -1330,6 +1350,9 @@ def main(argv=None):
 
     out_file = args.output or default_output(args.input, v.audio_codecs)
     out_file = check_output_container(os.path.abspath(out_file), v.audio_codecs)
+    if args.preview:
+        base, ext = os.path.splitext(out_file)
+        out_file = base + "_preview" + ext
 
     fps_f = float(v.fps)
     fps_desc = f"{fps_f:.3f} fps"
@@ -1355,7 +1378,8 @@ def main(argv=None):
          + ("  |  BEST quality" if args.best else "")
          + ("  |  EYE CANDY" if args.eyecandy and not args.reel else "")
          + ("  |  SMOOTH 2x" if args.smooth and not args.reel else "")
-         + ("  |  FAST mode" if args.fast else ""))
+         + ("  |  FAST mode" if args.fast else "")
+         + ("  |  PREVIEW ~8s" if args.preview else ""))
     if not args.best and args.engine != "cugan" \
             and min(v.width, v.height) < 700:
         info("  Tip     : low-res source detected -- try --best (sharper "
