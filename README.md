@@ -73,6 +73,31 @@ The defaults are already set for this machine — just run it plain:
   24 fps clip in ~1.5–2.5 minutes); `--fast` roughly doubles it.
   Plug in the charger — on battery the GPU throttles hard.
 
+## The Instagram-reel "eye candy" look
+
+Those buttery-smooth, punchy anime edits are three things stacked:
+a strong upscale, **doubled frame rate**, and a **color grade**. One flag
+does all of it:
+
+```powershell
+python upscale.py clip.mp4 --reel --turbo
+```
+
+`--reel` = Real-CUGAN with strong artifact removal + `--smooth`
+(AI motion interpolation with RIFE, 24 → 48 fps, seam-exact) +
+`--eyecandy` (deband, crisp line sharpening, vibrance, soft glow bloom)
++ high encode quality. The pieces also work individually:
+
+```powershell
+python upscale.py clip.mp4 --smooth            # just silky motion
+python upscale.py clip.mp4 --eyecandy          # just the grade
+python upscale.py clip.mp4 --best --eyecandy   # sharp model + grade
+```
+
+Advanced: community ncnn models (e.g. AnimeJaNai conversions from
+OpenModelDB) can be dropped into `bin/esrgan/**/models/` as
+`NAME.param` + `NAME.bin` and used with `--custom-model NAME --scale 2`.
+
 ## Getting maximum quality (fixing "weird AI look", mushy faces, bad lines)
 
 The default model is the *fast* one. If the output looks smeared or

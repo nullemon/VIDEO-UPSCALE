@@ -65,7 +65,26 @@ ENGINES = {
         "marker": "models-se",
         "label": "Real-CUGAN AI upscaler",
     },
+    # RIFE: motion interpolation (frame doubling) for silky reel-style motion
+    "rife": {
+        "url": ("https://github.com/nihui/rife-ncnn-vulkan/releases/"
+                "download/20221029/rife-ncnn-vulkan-20221029-{os}.zip"),
+        "exe": "rife-ncnn-vulkan",
+        "marker": "rife-v4.6",
+        "label": "RIFE motion interpolator",
+    },
 }
+
+# The "reel look": deband gradients, crisp lines, punchy color, soft bloom.
+EYECANDY_VF = (
+    "deband,"
+    "cas=0.45,"
+    "vibrance=intensity=0.12,"
+    "eq=contrast=1.05,"
+    "split[ec_m][ec_b];"
+    "[ec_b]gblur=sigma=14[ec_g];"
+    "[ec_m][ec_g]blend=all_mode=screen:all_opacity=0.15"
+)
 
 FFMPEG_WIN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 FFMPEG_LINUX_URL = (
@@ -710,6 +729,10 @@ class Pipeline:
             self.model_name = None
             self.denoise = args.denoise
             allowed = (2, 3, 4)
+        elif args.custom_model:
+            self.model_name = args.custom_model
+            self.denoise = None
+            allowed = (2, 3, 4)
         else:
             self.model_name, allowed, _ = MODELS[args.model]
             self.denoise = None
@@ -733,6 +756,10 @@ class Pipeline:
         self.src_matrix = source_color_matrix(vinfo)
         self.frame_bytes = vinfo.width * vinfo.height * 3  # rgb24
         self._cpu_warned = False
+        f2 = vinfo.fps * 2
+        self.fps2_str = f"{f2.numerator}/{f2.denominator}"
+        self.rife = tools.get("rife")
+        self.rife_root = tools.get("rife_root")
 
     # ---- commands ------------------------------------------------------
 
@@ -762,7 +789,7 @@ class Pipeline:
         cmd += [os.path.join(out_dir, f"%08d.{self.img_ext}")]
         return cmd
 
-    def upscale_cmd(self, in_dir, out_dir, tile):
+    def _jobs_and_gpu(self):
         jobs = self.args.jobs
         gpu = self.args.gpu
         if gpu and "," in gpu:
@@ -771,6 +798,10 @@ class Pipeline:
             if len(parts) == 3 and "," not in parts[1]:
                 parts[1] = ",".join([parts[1]] * len(gpu.split(",")))
                 jobs = ":".join(parts)
+        return jobs, gpu
+
+    def upscale_cmd(self, in_dir, out_dir, tile):
+        jobs, gpu = self._jobs_and_gpu()
         if self.args.engine == "cugan":
             # the "pro" models are higher quality but only exist for
             # 2x/3x with denoise -1/0/3
@@ -792,14 +823,29 @@ class Pipeline:
             cmd += ["-g", gpu]
         return cmd
 
-    def encode_cmd(self, in_dir, out_file):
+    def rife_cmd(self, in_dir, out_dir, target):
+        jobs, gpu = self._jobs_and_gpu()
+        cmd = [self.rife, "-i", in_dir, "-o", out_dir,
+               "-m", os.path.join(self.rife_root, "rife-v4.6"),
+               "-n", str(target),
+               "-f", f"%08d.{self.img_ext}", "-j", jobs]
+        if self.out_w * self.out_h >= 3200 * 1800:
+            cmd += ["-u"]  # UHD mode
+        if gpu is not None:
+            cmd += ["-g", gpu]
+        return cmd
+
+    def encode_cmd(self, in_dir, out_file, fps=None):
         # png intermediates are RGB (matrix applies on rgb->yuv output only);
         # jpg intermediates are YUV that JFIF convention codes as bt601.
         in_matrix = "bt601" if self.img_ext == "jpg" else None
+        vf = scale_filter(self.out_w, self.out_h, in_matrix)
+        if self.args.eyecandy:
+            vf += "," + EYECANDY_VF
         cmd = [self.ffmpeg, "-v", "error", "-y",
-               "-framerate", self.fps_str,
+               "-framerate", fps or self.fps_str,
                "-i", os.path.join(in_dir, f"%08d.{self.img_ext}"),
-               "-vf", scale_filter(self.out_w, self.out_h, in_matrix),
+               "-vf", vf,
                "-c:v", self.encoder]
         cmd += encoder_quality_args(self.encoder, self.args.quality, self.args.fast)
         cmd += ["-pix_fmt", "yuv420p",
@@ -915,6 +961,45 @@ class Pipeline:
                      f"retrying with tile size {tiles[i + 1]} ...")
         raise last_err
 
+    def smooth_chunk(self, idx, frames_dir, n, sentinel_src, workdir):
+        """Double the frame rate of one chunk with RIFE, seam-correct.
+
+        For every chunk except the last, the FIRST upscaled frame of the
+        NEXT chunk is appended as a sentinel so the interpolated frame
+        that belongs exactly on the chunk seam gets generated; the
+        sentinel itself is dropped afterwards (the next chunk starts
+        with it). Output frame counts: 2n per chunk, 2n-1 for the last
+        -- identical to interpolating the whole video in one pass."""
+        ext = self.img_ext
+        if sentinel_src:
+            shutil.copyfile(sentinel_src,
+                            os.path.join(frames_dir, f"{n + 1:08d}.{ext}"))
+            target = 2 * n + 1
+        else:
+            if n < 2:  # single trailing frame: just duplicate it
+                shutil.copyfile(
+                    os.path.join(frames_dir, f"{1:08d}.{ext}"),
+                    os.path.join(frames_dir, f"{2:08d}.{ext}"))
+                return frames_dir, 2
+            target = 2 * n - 1
+        smooth_dir = os.path.join(workdir, f"smooth_{idx:05d}")
+        os.makedirs(smooth_dir, exist_ok=True)
+        run(self.rife_cmd(frames_dir, smooth_dir, target),
+            desc="motion smoothing (RIFE)")
+        got = self._count_frames(smooth_dir)
+        if got < target:
+            raise RuntimeError(
+                f"motion smoothing produced {got}/{target} frames -- "
+                f"retry without --smooth (or with --tile 128)")
+        kept = target
+        if sentinel_src:
+            # drop the sentinel endpoint; the next chunk begins with it
+            os.remove(os.path.join(smooth_dir, f"{target:08d}.{ext}"))
+            kept = target - 1
+        if not self.args.keep_temp:
+            shutil.rmtree(frames_dir, ignore_errors=True)
+        return smooth_dir, kept
+
     # ---- main loop -------------------------------------------------------
 
     def process(self, workdir):
@@ -945,6 +1030,17 @@ class Pipeline:
                     for d in dirs:
                         shutil.rmtree(d, ignore_errors=True)
 
+        def dispatch(idx, frames_dir, fps_str):
+            chunk_file = os.path.join(workdir, f"chunk_{idx:05d}.mp4")
+            enc = start(self.encode_cmd(frames_dir, chunk_file, fps_str),
+                        desc=f"encode (chunk {idx})",
+                        stderr_path=os.path.join(workdir, f"encode_{idx:05d}.log"))
+            pending.append((enc, [frames_dir]))
+            chunk_files.append(chunk_file)
+            reap()
+
+        held = None  # (idx, out_dir, n): chunk awaiting its seam frame
+
         try:
             while True:
                 kind, a, b, c = out_q.get()
@@ -964,13 +1060,21 @@ class Pipeline:
                     shutil.rmtree(in_dir, ignore_errors=True)
                 sem.release()
 
-                chunk_file = os.path.join(workdir, f"chunk_{idx:05d}.mp4")
-                enc = start(self.encode_cmd(out_dir, chunk_file),
-                            desc=f"encode (chunk {idx})",
-                            stderr_path=os.path.join(workdir, f"encode_{idx:05d}.log"))
-                pending.append((enc, [out_dir]))
-                chunk_files.append(chunk_file)
-                reap()
+                if not self.args.smooth:
+                    dispatch(idx, out_dir, self.fps_str)
+                    continue
+                # smooth mode: a chunk is finalized only after the next
+                # chunk's first upscaled frame exists (seam interpolation)
+                if held is not None:
+                    hidx, hdir, hn = held
+                    seam = os.path.join(out_dir, f"{1:08d}.{self.img_ext}")
+                    sdir, _kept = self.smooth_chunk(hidx, hdir, hn, seam, workdir)
+                    dispatch(hidx, sdir, self.fps2_str)
+                held = (idx, out_dir, n)
+            if held is not None:
+                hidx, hdir, hn = held
+                sdir, _kept = self.smooth_chunk(hidx, hdir, hn, None, workdir)
+                dispatch(hidx, sdir, self.fps2_str)
             reap(block_all=True)
             progress.finish()
         except BaseException:
@@ -1079,9 +1183,22 @@ def parse_args(argv):
                         "(x4plus-anime, ~3-4x slower), 4x supersampling, "
                         "higher encode quality. Best for low-res or "
                         "heavily compressed sources")
+    p.add_argument("--reel", action="store_true",
+                   help="the Instagram-reel eye-candy preset: cugan engine "
+                        "with strong artifact removal + --eyecandy grade + "
+                        "--smooth motion, high encode quality")
+    p.add_argument("--smooth", action="store_true",
+                   help="double the frame rate with AI motion interpolation "
+                        "(RIFE) for silky reel-style motion")
+    p.add_argument("--eyecandy", action="store_true",
+                   help="reel-style grade: deband + crisp line sharpening + "
+                        "vibrance + soft glow bloom")
+    p.add_argument("--custom-model", metavar="NAME",
+                   help="use a community ncnn model you dropped into the "
+                        "esrgan models folder (requires explicit --scale)")
     p.add_argument("--scale", choices=["auto", "2", "3", "4"], default="auto",
                    help="AI scale factor (auto = smallest that reaches 4K)")
-    p.add_argument("--engine", choices=["esrgan", "cugan"], default="esrgan",
+    p.add_argument("--engine", choices=["esrgan", "cugan"],
                    help="AI engine: esrgan=Real-ESRGAN (default); "
                         "cugan=Real-CUGAN, best for compressed/low-quality "
                         "sources (combine with --denoise 3)")
@@ -1137,8 +1254,24 @@ def main(argv=None):
     VERBOSE = args.verbose
     if args.best and args.fast:
         die("--best and --fast pull in opposite directions -- pick one")
+    if args.reel:
+        args.eyecandy = True
+        args.smooth = True
+        if args.engine is None:
+            args.engine = "cugan"
+        if args.engine == "cugan" and args.denoise == 0:
+            args.denoise = 3
+        if args.quality is None:
+            args.quality = 15
+    if args.engine is None:
+        args.engine = "esrgan"
     if args.model is not None and args.engine == "cugan":
         warn("--model applies to the esrgan engine only; ignoring it")
+    if args.custom_model:
+        if args.engine != "esrgan":
+            die("--custom-model works with the esrgan engine only")
+        if args.scale == "auto":
+            die("--custom-model needs an explicit --scale matching the model")
     if args.model is None:
         args.model = "anime-sharp" if args.best else "animevideo"
     if args.best and args.quality is None:
@@ -1169,6 +1302,9 @@ def main(argv=None):
                 info(f"    {eng:<10} : {exe}")
             return 0
         upscaler, engine_root = ensure_upscaler(bin_dir, args.engine)
+        rife = rife_root = None
+        if args.smooth:
+            rife, rife_root = ensure_upscaler(bin_dir, "rife")
     except RuntimeError as e:
         die(str(e))
 
@@ -1187,7 +1323,8 @@ def main(argv=None):
             f"Use --force to process anyway.")
 
     tools = {"ffmpeg": ffmpeg, "ffprobe": ffprobe,
-             "upscaler": upscaler, "engine_root": engine_root}
+             "upscaler": upscaler, "engine_root": engine_root,
+             "rife": rife, "rife_root": rife_root}
     pipe = Pipeline(args, tools, v)
     ow, oh = pipe.out_w, pipe.out_h
 
@@ -1195,11 +1332,14 @@ def main(argv=None):
     out_file = check_output_container(os.path.abspath(out_file), v.audio_codecs)
 
     fps_f = float(v.fps)
+    fps_desc = f"{fps_f:.3f} fps"
+    if args.smooth:
+        fps_desc += f" -> {fps_f * 2:.3f} fps (AI-smoothed)"
     audio_desc = ", ".join(v.audio_codecs) + " (copied bit-for-bit)" \
         if v.audio_codecs else "none"
     info("")
     info(f"  Input   : {os.path.basename(args.input)}")
-    info(f"            {v.width}x{v.height} {v.video_codec} @ {fps_f:.3f} fps"
+    info(f"            {v.width}x{v.height} {v.video_codec} @ {fps_desc}"
          f"  |  {fmt_time(v.duration)}  |  ~{v.est_frames} frames")
     info(f"  Audio   : {audio_desc}")
     info(f"  Output  : {os.path.basename(out_file)}  ->  {ow}x{oh} (Ultra 4K UHD)")
@@ -1210,8 +1350,11 @@ def main(argv=None):
         info(f"  AI      : {pipe.model_name} x{pipe.ai_scale} on GPU (Vulkan)")
     info(f"  Encoder : {pipe.encoder}"
          + ("  [hardware]" if pipe.encoder != "libx264" else "  [cpu]")
+         + ("  |  REEL" if args.reel else "")
          + ("  |  TURBO" if args.turbo else "")
          + ("  |  BEST quality" if args.best else "")
+         + ("  |  EYE CANDY" if args.eyecandy and not args.reel else "")
+         + ("  |  SMOOTH 2x" if args.smooth and not args.reel else "")
          + ("  |  FAST mode" if args.fast else ""))
     if not args.best and args.engine != "cugan" \
             and min(v.width, v.height) < 700:
