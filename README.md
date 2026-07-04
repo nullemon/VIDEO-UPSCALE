@@ -73,6 +73,29 @@ The defaults are already set for this machine — just run it plain:
   24 fps clip in ~1.5–2.5 minutes); `--fast` roughly doubles it.
   Plug in the charger — on battery the GPU throttles hard.
 
+## Getting maximum quality (fixing "weird AI look", mushy faces, bad lines)
+
+The default model is the *fast* one. If the output looks smeared or
+artificial, step up — in order of what usually fixes it:
+
+```powershell
+# 1) Sharper anime model + 4x supersampling (best for clean 720p/1080p sources)
+python upscale.py clip.mp4 --best --turbo
+
+# 2) Compressed/low-quality source (WhatsApp/Instagram/YouTube rips):
+#    Real-CUGAN removes compression artifacts WHILE upscaling
+python upscale.py clip.mp4 --engine cugan --denoise 3 --turbo
+
+# 3) Both ideas together: cugan with best-quality encode settings
+python upscale.py clip.mp4 --engine cugan --best --turbo
+```
+
+**The source matters more than anything.** AI amplifies what it's given:
+a 320p watermarked social-media rip cannot become true 4K — faces are a
+few pixels wide, so the AI has nothing to rebuild from. Feed the highest
+quality copy you can find (1080p original > YouTube > WhatsApp rip), and
+quality follows.
+
 ## Making it faster
 
 | What | How | Effect |
@@ -95,6 +118,12 @@ settings → Power management → **Prefer maximum performance**.
 python upscale.py INPUT
   -o, --output FILE   output file (default: <name>_4K.mp4 next to the input)
   --fast              speed mode (jpeg intermediates + faster encode preset)
+  --best              max quality: sharper model, 4x supersampling, better encode
+  --turbo             max GPU/CPU utilization (8:4:8 threads, bigger chunks)
+  --engine {esrgan,cugan}
+                      esrgan = Real-ESRGAN (default)
+                      cugan  = Real-CUGAN, cleans compression artifacts
+  --denoise {-1,0,1,2,3}  cugan artifact removal (3 = strongest)
   --scale {auto,2,3,4}  AI scale factor (default: auto)
   --model {animevideo,anime-sharp,photo}
                       animevideo = fast anime video model (default)

@@ -46,15 +46,25 @@ from fractions import Fraction
 TARGET_LONG = 3840   # 4K UHD box (long side)
 TARGET_SHORT = 2160  # 4K UHD box (short side)
 
-REALESRGAN_RELEASE = (
-    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/"
-    "realesrgan-ncnn-vulkan-20220424-{os}.zip"
-)
-REALESRGAN_OS = {"Windows": "windows", "Linux": "ubuntu", "Darwin": "macos"}
-REALESRGAN_EXE = {
-    "Windows": "realesrgan-ncnn-vulkan.exe",
-    "Linux": "realesrgan-ncnn-vulkan",
-    "Darwin": "realesrgan-ncnn-vulkan",
+OS_TAG = {"Windows": "windows", "Linux": "ubuntu", "Darwin": "macos"}
+
+ENGINES = {
+    # Real-ESRGAN: the classic; animevideo model is fast, x4plus-anime sharp
+    "esrgan": {
+        "url": ("https://github.com/xinntao/Real-ESRGAN/releases/download/"
+                "v0.2.5.0/realesrgan-ncnn-vulkan-20220424-{os}.zip"),
+        "exe": "realesrgan-ncnn-vulkan",
+        "marker": "models",           # dir that must sit next to the exe
+        "label": "Real-ESRGAN AI upscaler",
+    },
+    # Real-CUGAN: anime-specific, with built-in compression-artifact removal
+    "cugan": {
+        "url": ("https://github.com/nihui/realcugan-ncnn-vulkan/releases/"
+                "download/20220728/realcugan-ncnn-vulkan-20220728-{os}.zip"),
+        "exe": "realcugan-ncnn-vulkan",
+        "marker": "models-se",
+        "label": "Real-CUGAN AI upscaler",
+    },
 }
 
 FFMPEG_WIN_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
@@ -322,43 +332,45 @@ def ensure_ffmpeg(bin_dir):
     return ff, fp
 
 
-def ensure_realesrgan(bin_dir):
-    """Return (exe, models_dir); download the release zip if missing."""
+def ensure_upscaler(bin_dir, engine):
+    """Return (exe, engine_root_dir) for an AI engine; download if missing."""
+    cfg = ENGINES[engine]
     system = platform.system()
-    exe_name = REALESRGAN_EXE.get(system)
-    if exe_name is None:
+    if system not in OS_TAG:
         die(f"unsupported OS for the GPU upscaler: {system}")
+    exe_name = cfg["exe"] + (".exe" if os.name == "nt" else "")
 
-    # allow a user-provided binary on PATH (models dir must sit next to it)
-    on_path = shutil.which("realesrgan-ncnn-vulkan")
+    # allow a user-provided binary on PATH (model dir must sit next to it)
+    on_path = shutil.which(cfg["exe"])
     if on_path:
-        models = os.path.join(os.path.dirname(os.path.abspath(on_path)), "models")
-        if os.path.isdir(models):
-            return on_path, models
+        root = os.path.dirname(os.path.abspath(on_path))
+        if os.path.isdir(os.path.join(root, cfg["marker"])):
+            return on_path, root
 
+    # previously downloaded (search all of bin/ -- exe names are unique,
+    # and this also finds pre-rename legacy locations)
     exe = find_in_tree(bin_dir, exe_name)
     if exe:
-        models = os.path.join(os.path.dirname(exe), "models")
-        if os.path.isdir(models):
-            return exe, models
+        root = os.path.dirname(exe)
+        if os.path.isdir(os.path.join(root, cfg["marker"])):
+            return exe, root
 
-    os_tag = REALESRGAN_OS[system]
-    url = REALESRGAN_RELEASE.format(os=os_tag)
-    target = os.path.join(bin_dir, "realesrgan")
+    url = cfg["url"].format(os=OS_TAG[system])
+    target = os.path.join(bin_dir, engine)
     os.makedirs(target, exist_ok=True)
-    archive = os.path.join(bin_dir, "realesrgan.zip")
-    download(url, archive, "Real-ESRGAN AI upscaler (one-time, ~40 MB)")
+    archive = os.path.join(bin_dir, engine + ".zip")
+    download(url, archive, f"{cfg['label']} (one-time, ~40 MB)")
     extract_archive(archive, target)
     os.remove(archive)
     exe = find_in_tree(target, exe_name)
     if not exe:
-        die("Real-ESRGAN download did not contain the expected binary")
+        die(f"{cfg['label']} download did not contain the expected binary")
     if os.name != "nt":
         os.chmod(exe, 0o755)
-    models = os.path.join(os.path.dirname(exe), "models")
-    if not os.path.isdir(models):
-        die("Real-ESRGAN download did not contain the models folder")
-    return exe, models
+    root = os.path.dirname(exe)
+    if not os.path.isdir(os.path.join(root, cfg["marker"])):
+        die(f"{cfg['label']} download did not contain the models folder")
+    return exe, root
 
 
 # --------------------------------------------------------------------------
@@ -691,10 +703,16 @@ class Pipeline:
     def __init__(self, args, tools, vinfo):
         self.args = args
         self.ffmpeg = tools["ffmpeg"]
-        self.realesrgan = tools["realesrgan"]
-        self.models_dir = tools["models"]
+        self.upscaler = tools["upscaler"]
+        self.engine_root = tools["engine_root"]
         self.v = vinfo
-        self.model_name, allowed, _ = MODELS[args.model]
+        if args.engine == "cugan":
+            self.model_name = None
+            self.denoise = args.denoise
+            allowed = (2, 3, 4)
+        else:
+            self.model_name, allowed, _ = MODELS[args.model]
+            self.denoise = None
         disp_w, disp_h = vinfo.display_dims()
         if args.scale != "auto":
             s = int(args.scale)
@@ -703,6 +721,10 @@ class Pipeline:
             self.ai_scale = s
         else:
             self.ai_scale, _fit = choose_ai_scale(disp_w, disp_h, allowed)
+        if args.engine == "cugan" and self.denoise in (1, 2) \
+                and self.ai_scale != 2:
+            warn(f"denoise {self.denoise} only exists for 2x; using 3")
+            self.denoise = 3
         self.img_ext = "jpg" if args.fast else "png"
         self.fps_str = f"{vinfo.fps.numerator}/{vinfo.fps.denominator}"
         self.use_fps_mode = ffmpeg_supports_fps_mode(self.ffmpeg)
@@ -749,10 +771,21 @@ class Pipeline:
             if len(parts) == 3 and "," not in parts[1]:
                 parts[1] = ",".join([parts[1]] * len(gpu.split(",")))
                 jobs = ":".join(parts)
-        cmd = [self.realesrgan, "-i", in_dir, "-o", out_dir,
-               "-n", self.model_name, "-s", str(self.ai_scale),
-               "-m", self.models_dir, "-f", self.img_ext,
-               "-j", jobs]
+        if self.args.engine == "cugan":
+            # the "pro" models are higher quality but only exist for
+            # 2x/3x with denoise -1/0/3
+            mdir = os.path.join(self.engine_root, "models-pro")
+            if not (self.ai_scale in (2, 3) and self.denoise in (-1, 0, 3)
+                    and os.path.isdir(mdir)):
+                mdir = os.path.join(self.engine_root, "models-se")
+            cmd = [self.upscaler, "-i", in_dir, "-o", out_dir,
+                   "-n", str(self.denoise), "-s", str(self.ai_scale),
+                   "-m", mdir, "-f", self.img_ext, "-j", jobs]
+        else:
+            cmd = [self.upscaler, "-i", in_dir, "-o", out_dir,
+                   "-n", self.model_name, "-s", str(self.ai_scale),
+                   "-m", os.path.join(self.engine_root, "models"),
+                   "-f", self.img_ext, "-j", jobs]
         if tile:
             cmd += ["-t", str(tile)]
         if gpu is not None:
@@ -1041,10 +1074,25 @@ def parse_args(argv):
                    help="run the machine at full tilt: more concurrent GPU "
                         "jobs (8:4:8), bigger chunks (300). Combine with "
                         "--fast for maximum speed")
+    p.add_argument("--best", action="store_true",
+                   help="maximum quality: the sharper anime model "
+                        "(x4plus-anime, ~3-4x slower), 4x supersampling, "
+                        "higher encode quality. Best for low-res or "
+                        "heavily compressed sources")
     p.add_argument("--scale", choices=["auto", "2", "3", "4"], default="auto",
                    help="AI scale factor (auto = smallest that reaches 4K)")
-    p.add_argument("--model", choices=sorted(MODELS), default="animevideo",
-                   help="AI model: " + "; ".join(f"{k}={v[2]}" for k, v in MODELS.items()))
+    p.add_argument("--engine", choices=["esrgan", "cugan"], default="esrgan",
+                   help="AI engine: esrgan=Real-ESRGAN (default); "
+                        "cugan=Real-CUGAN, best for compressed/low-quality "
+                        "sources (combine with --denoise 3)")
+    p.add_argument("--denoise", type=int, choices=[-1, 0, 1, 2, 3], default=0,
+                   help="cugan only: compression-artifact removal strength "
+                        "(3 = strongest, ideal for social-media rips; "
+                        "-1 = conservative)")
+    p.add_argument("--model", choices=sorted(MODELS),
+                   help="esrgan model (default: animevideo, or anime-sharp "
+                        "with --best): "
+                        + "; ".join(f"{k}={v[2]}" for k, v in MODELS.items()))
     p.add_argument("--encoder", help="force a specific ffmpeg video encoder "
                                      "(default: auto-detect NVENC/QSV/AMF, else x264)")
     p.add_argument("--quality", type=int,
@@ -1087,10 +1135,22 @@ def main(argv=None):
     global VERBOSE
     args = parse_args(argv)
     VERBOSE = args.verbose
+    if args.best and args.fast:
+        die("--best and --fast pull in opposite directions -- pick one")
+    if args.model is not None and args.engine == "cugan":
+        warn("--model applies to the esrgan engine only; ignoring it")
+    if args.model is None:
+        args.model = "anime-sharp" if args.best else "animevideo"
+    if args.best and args.quality is None:
+        args.quality = 15
+    if args.best and args.engine == "cugan" and args.denoise == 0:
+        args.denoise = 3  # --best on cugan implies strong artifact removal
     if args.jobs is None:
         args.jobs = "8:4:8" if args.turbo else "4:2:4"
     if args.chunk is None:
-        args.chunk = 300 if args.turbo else 150
+        # 4x intermediates in --best mode are huge; smaller chunks keep
+        # temp disk bounded
+        args.chunk = 100 if args.best else (300 if args.turbo else 150)
     if args.chunk < 1:
         die("--chunk must be at least 1")
     if args.quality is not None and not 0 <= args.quality <= 51:
@@ -1101,14 +1161,16 @@ def main(argv=None):
     bin_dir = os.path.join(script_dir(), "bin")
     try:
         ffmpeg, ffprobe = ensure_ffmpeg(bin_dir)
-        realesrgan, models = ensure_realesrgan(bin_dir)
+        if args.setup_only:
+            info("[+] Tools ready:")
+            info(f"    ffmpeg     : {ffmpeg}")
+            for eng in ENGINES:
+                exe, _root = ensure_upscaler(bin_dir, eng)
+                info(f"    {eng:<10} : {exe}")
+            return 0
+        upscaler, engine_root = ensure_upscaler(bin_dir, args.engine)
     except RuntimeError as e:
         die(str(e))
-    if args.setup_only:
-        info("[+] Tools ready:")
-        info(f"    ffmpeg     : {ffmpeg}")
-        info(f"    upscaler   : {realesrgan}")
-        return 0
 
     if not args.input:
         args.input = interactive_input()
@@ -1125,7 +1187,7 @@ def main(argv=None):
             f"Use --force to process anyway.")
 
     tools = {"ffmpeg": ffmpeg, "ffprobe": ffprobe,
-             "realesrgan": realesrgan, "models": models}
+             "upscaler": upscaler, "engine_root": engine_root}
     pipe = Pipeline(args, tools, v)
     ow, oh = pipe.out_w, pipe.out_h
 
@@ -1141,11 +1203,20 @@ def main(argv=None):
          f"  |  {fmt_time(v.duration)}  |  ~{v.est_frames} frames")
     info(f"  Audio   : {audio_desc}")
     info(f"  Output  : {os.path.basename(out_file)}  ->  {ow}x{oh} (Ultra 4K UHD)")
-    info(f"  AI      : {pipe.model_name} x{pipe.ai_scale} on GPU (Vulkan)")
+    if args.engine == "cugan":
+        info(f"  AI      : Real-CUGAN x{pipe.ai_scale} denoise={pipe.denoise}"
+             f" on GPU (Vulkan)")
+    else:
+        info(f"  AI      : {pipe.model_name} x{pipe.ai_scale} on GPU (Vulkan)")
     info(f"  Encoder : {pipe.encoder}"
          + ("  [hardware]" if pipe.encoder != "libx264" else "  [cpu]")
          + ("  |  TURBO" if args.turbo else "")
+         + ("  |  BEST quality" if args.best else "")
          + ("  |  FAST mode" if args.fast else ""))
+    if not args.best and args.engine != "cugan" \
+            and min(v.width, v.height) < 700:
+        info("  Tip     : low-res source detected -- try --best (sharper "
+             "lines) or --engine cugan --denoise 3 (cleans compression)")
     info("")
 
     workdir_root = args.workdir or tempfile.gettempdir()
