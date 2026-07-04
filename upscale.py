@@ -1042,7 +1042,7 @@ def parse_args(argv):
     p.add_argument("--tile", type=int,
                    help="GPU tile size (default auto; use 256/128 on low VRAM)")
     p.add_argument("--gpu", type=int, help="GPU index (dual-GPU laptops: try 1)")
-    p.add_argument("--jobs", default="2:2:2",
+    p.add_argument("--jobs", default="4:2:4",
                    help="upscaler threads as load:proc:save")
     p.add_argument("--workdir", help="directory for temp files "
                                      "(default: system temp)")

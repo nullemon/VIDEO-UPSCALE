@@ -57,6 +57,22 @@ resize. Anamorphic (non-square-pixel) and rotated sources are detected and
 handled correctly, and every upscale is verified frame-by-frame — if the
 GPU runs out of memory the tool retries automatically with smaller tiles.
 
+## Tuned for: Alienware m16 R2 (RTX 4060 Laptop 8 GB + Core Ultra 9 185H)
+
+The defaults are already set for this machine — just run it plain:
+
+- The AI engine auto-picks the **RTX 4060** (discrete GPUs are preferred
+  over the Intel Arc iGPU). If Task Manager ever shows GPU 0 busy and
+  GPU 1 idle during a run, add `--gpu 1`.
+- Encoding auto-selects **NVENC** (hardware HEVC) — the encode step is
+  effectively free.
+- 8 GB VRAM handles full-frame tiles at every scale — no `--tile` needed.
+- The Intel **NPU (AI Boost) is not used** — this pipeline runs on Vulkan
+  GPU compute, which the NPU doesn't expose. The 4060 is far faster anyway.
+- Ballpark speed for 1080p → 4K: roughly **10–20 frames/s** (a 1-minute
+  24 fps clip in ~1.5–2.5 minutes); `--fast` roughly doubles it.
+  Plug in the charger — on battery the GPU throttles hard.
+
 ## Making it faster
 
 | What | How | Effect |
