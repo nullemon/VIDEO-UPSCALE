@@ -741,14 +741,22 @@ class Pipeline:
         return cmd
 
     def upscale_cmd(self, in_dir, out_dir, tile):
+        jobs = self.args.jobs
+        gpu = self.args.gpu
+        if gpu and "," in gpu:
+            # multi-GPU: ncnn wants one proc-thread count per GPU
+            parts = jobs.split(":")
+            if len(parts) == 3 and "," not in parts[1]:
+                parts[1] = ",".join([parts[1]] * len(gpu.split(",")))
+                jobs = ":".join(parts)
         cmd = [self.realesrgan, "-i", in_dir, "-o", out_dir,
                "-n", self.model_name, "-s", str(self.ai_scale),
                "-m", self.models_dir, "-f", self.img_ext,
-               "-j", self.args.jobs]
+               "-j", jobs]
         if tile:
             cmd += ["-t", str(tile)]
-        if self.args.gpu is not None:
-            cmd += ["-g", str(self.args.gpu)]
+        if gpu is not None:
+            cmd += ["-g", gpu]
         return cmd
 
     def encode_cmd(self, in_dir, out_file):
@@ -1029,6 +1037,10 @@ def parse_args(argv):
     p.add_argument("-o", "--output", help="output file (default: <name>_4K.mp4)")
     p.add_argument("--fast", action="store_true",
                    help="speed mode: jpeg intermediates + faster encoder preset")
+    p.add_argument("--turbo", action="store_true",
+                   help="run the machine at full tilt: more concurrent GPU "
+                        "jobs (8:4:8), bigger chunks (300). Combine with "
+                        "--fast for maximum speed")
     p.add_argument("--scale", choices=["auto", "2", "3", "4"], default="auto",
                    help="AI scale factor (auto = smallest that reaches 4K)")
     p.add_argument("--model", choices=sorted(MODELS), default="animevideo",
@@ -1037,13 +1049,15 @@ def parse_args(argv):
                                      "(default: auto-detect NVENC/QSV/AMF, else x264)")
     p.add_argument("--quality", type=int,
                    help="encoder quality (CRF/CQ, lower=better; default 16-19)")
-    p.add_argument("--chunk", type=int, default=150,
-                   help="frames per chunk (bounds temp disk usage)")
+    p.add_argument("--chunk", type=int,
+                   help="frames per chunk (default 150, turbo 300; bounds "
+                        "temp disk usage)")
     p.add_argument("--tile", type=int,
                    help="GPU tile size (default auto; use 256/128 on low VRAM)")
-    p.add_argument("--gpu", type=int, help="GPU index (dual-GPU laptops: try 1)")
-    p.add_argument("--jobs", default="4:2:4",
-                   help="upscaler threads as load:proc:save")
+    p.add_argument("--gpu", help="GPU index, or comma list to use several "
+                                 "at once (e.g. --gpu 0,1)")
+    p.add_argument("--jobs", help="upscaler threads as load:proc:save "
+                                  "(default 4:2:4, turbo 8:4:8)")
     p.add_argument("--workdir", help="directory for temp files "
                                      "(default: system temp)")
     p.add_argument("--keep-temp", action="store_true",
@@ -1073,10 +1087,16 @@ def main(argv=None):
     global VERBOSE
     args = parse_args(argv)
     VERBOSE = args.verbose
+    if args.jobs is None:
+        args.jobs = "8:4:8" if args.turbo else "4:2:4"
+    if args.chunk is None:
+        args.chunk = 300 if args.turbo else 150
     if args.chunk < 1:
         die("--chunk must be at least 1")
     if args.quality is not None and not 0 <= args.quality <= 51:
         die("--quality must be between 0 and 51")
+    if args.gpu is not None and not re.fullmatch(r"\d+(,\d+)*", args.gpu):
+        die("--gpu must be a GPU index or comma list, e.g. 1 or 0,1")
 
     bin_dir = os.path.join(script_dir(), "bin")
     try:
@@ -1124,6 +1144,7 @@ def main(argv=None):
     info(f"  AI      : {pipe.model_name} x{pipe.ai_scale} on GPU (Vulkan)")
     info(f"  Encoder : {pipe.encoder}"
          + ("  [hardware]" if pipe.encoder != "libx264" else "  [cpu]")
+         + ("  |  TURBO" if args.turbo else "")
          + ("  |  FAST mode" if args.fast else ""))
     info("")
 

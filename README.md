@@ -77,11 +77,17 @@ The defaults are already set for this machine — just run it plain:
 
 | What | How | Effect |
 |---|---|---|
+| Turbo mode | `--turbo` | 8:4:8 upscaler threads + 300-frame chunks — saturates a strong GPU |
 | Fast mode | `--fast` | JPEG intermediates + faster encoder preset; ~2× faster, ~10× less temp disk |
+| Both GPUs at once | `--gpu 0,1` | Adds the iGPU alongside the discrete GPU (try it; watch thermals) |
 | Force the discrete GPU | `--gpu 1` | Dual-GPU laptops sometimes default to the slow integrated GPU |
-| More GPU threads | `--jobs 2:4:2` | Helps on beefy GPUs (load:proc:save threads) |
 | Lower the target quality | `--quality 22` | Smaller/faster encode (CRF/CQ, lower = better) |
 | Plug in the charger | — | Laptops heavily throttle the GPU on battery |
+
+Maximum overdrive: `--turbo --fast`, plus the Windows side: power mode
+**Best performance**, the laptop's performance/fan profile (e.g. Alienware
+Command Center → Performance), and NVIDIA Control Panel → Manage 3D
+settings → Power management → **Prefer maximum performance**.
 
 ## All options
 
